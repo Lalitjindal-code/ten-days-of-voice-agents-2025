@@ -1,0 +1,11 @@
+{
+    "drinkType": "cappuccino",
+    "size": "medium",
+    "milk": "whole",
+    "extras": [
+        "sugar"
+    ],
+    "name": "Lalit",
+    "timestamp": "2025-11-23T18:47:46.501818",
+    "session_id": "session_20251123_184746"
+}
