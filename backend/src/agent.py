@@ -43,6 +43,7 @@ load_dotenv(".env.local")
 
 DB_FILE = "fraud_db.json"
 
+# Schema as requested
 @dataclass
 class FraudCase:
     userName: str
@@ -132,7 +133,7 @@ async def lookup_customer(
             
             # Return info to the LLM so it can verify the user
             return (
-                "Record Found.\n"
+                "Record Found. \n"
                 f"User: {found_record['userName']}\n"
                 f"Security ID (Expected): {found_record['securityIdentifier']}\n"
                 f"Transaction Details: {found_record['transactionAmount']} at "
@@ -142,8 +143,8 @@ async def lookup_customer(
             )
         else:
             return (
-                "User not found in the fraud database. Ask them to repeat the name or direct "
-                "them to contact bank support manually."
+                "User not found in the fraud database. Ask them to repeat the name or "
+                "contact support manually."
             )
             
     except Exception as e:
@@ -167,7 +168,7 @@ async def resolve_fraud_case(
     case.case_status = status
     case.notes = notes
     
-    # Update database file
+    # Update Database File
     path = os.path.join(os.path.dirname(__file__), DB_FILE)
     try:
         with open(path, "r") as f:
@@ -179,20 +180,20 @@ async def resolve_fraud_case(
                 data[i] = asdict(case)
                 break
         
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w") as f:
             json.dump(data, f, indent=4)
             
         print(f"✅ CASE UPDATED: {case.userName} -> {status}")
         
         if status == "confirmed_fraud":
             return (
-                "Case updated as FRAUD. Inform the user: "
-                f"Card ending in {case.cardEnding} is now blocked. A new card will be mailed."
+                "Case updated as FRAUD. Inform the user: Card ending in "
+                f"{case.cardEnding} is now blocked. A new card will be mailed."
             )
         else:
             return (
-                "Case updated as SAFE. Inform the user: "
-                "The restriction has been lifted. Thank you for verifying."
+                "Case updated as SAFE. Inform the user: The restriction has been lifted. "
+                "Thank you for verifying."
             )
 
     except Exception as e:
@@ -210,36 +211,36 @@ class FraudAgent(Agent):
             Your job is to verify a suspicious transaction with the customer efficiently and professionally.
 
             🛡️ SECURITY PROTOCOL (FOLLOW STRICTLY):
-
+            
             1. GREETING & ID:
                - State that you are calling about a security alert.
                - Ask: "Am I speaking with the account holder? May I have your first name?"
-
+            
             2. LOOKUP:
                - Use tool `lookup_customer` immediately when you hear the name.
-
+            
             3. VERIFICATION:
                - Once the record is loaded, ask for their Security Identifier.
                - Compare their answer to the data returned by the tool.
-               - If WRONG: politely apologize and end the conversation.
-               - If CORRECT: proceed.
-
+               - IF WRONG: Politely apologize and end the conversation.
+               - IF CORRECT: Proceed.
+            
             4. TRANSACTION REVIEW:
                - Read the transaction details clearly:
                  "We flagged a charge of [Amount] at [Merchant] on [Time]."
                - Ask: "Did you make this transaction?"
-
+            
             5. RESOLUTION:
-               - If user says YES (legit): use `resolve_fraud_case(status="confirmed_safe")`.
-               - If user says NO (fraud): use `resolve_fraud_case(status="confirmed_fraud")`.
-
+               - If user says YES (Legit): Use tool `resolve_fraud_case(status="confirmed_safe")`.
+               - If user says NO (Fraud): Use tool `resolve_fraud_case(status="confirmed_fraud")`.
+            
             6. CLOSING:
-               - Confirm the action taken (card blocked or restriction removed).
+               - Confirm the action taken (Card blocked OR unblocked).
                - Say goodbye professionally.
 
-            TONE:
+            ⚠️ TONE:
             - Calm, authoritative, reassuring.
-            - Do NOT ask for full card numbers, passwords, or sensitive credentials beyond the Security Identifier.
+            - Do NOT ask for full card numbers, passwords, or other sensitive credentials.
             """,
             tools=[lookup_customer, resolve_fraud_case],
         )
@@ -263,9 +264,9 @@ async def entrypoint(ctx: JobContext):
     # 2. Setup Agent
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
+        llm=google.LLM(model="gemini-2.5-flash"),  # Ensure you have access to this model version
         tts=murf.TTS(
-            voice="en-US-marcus",  # Serious, professional male voice
+            voice="en-US-marcus",  # A serious, professional male voice
             style="Conversational",
             text_pacing=True,
         ),
