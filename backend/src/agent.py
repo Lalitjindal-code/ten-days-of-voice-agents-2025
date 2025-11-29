@@ -1,28 +1,33 @@
-# food_agent_sqlite.py
+# IMPROVE THE AGENT AS PER YOUR NEED 1
 """
-Day 7 – Food & Grocery Ordering Voice Agent (SQLite) - Indian Context
-- Uses SQLite DB 'order_db.sqlite'
-- Seeds Indian catalog (Amul, Tata, Britannia, etc.)
+Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
+
+- Uses LiveKit agent plumbing similar to the food_agent_sqlite example.
+- GM persona, universe, tone and rules are encoded in the agent instructions.
+- STT/TTS/Turn detector/VAD integration:
+    - STT: Deepgram
+    - LLM: Google Gemini
+    - TTS: Murf
+    - VAD: Silero
+    - Turn detection: MultilingualModel
 - Tools:
-    - find_item (search catalog)
-    - add_to_cart / remove_from_cart / update_cart / show_cart
-    - add_recipe / ingredients_for
-    - place_order (Trigger auto-status update simulation)
-    - cancel_order
-    - get_order_status / order_history
-- Auto-simulation: Status updates every 5 seconds in background.
+    - start_adventure(): start a fresh session and introduce the scene
+    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
+    - player_action(action_text): accept player's spoken action, update state, advance scene
+    - show_journal(): list remembered facts, NPCs, named locations, choices
+    - restart_adventure(): reset state and start over
+- Userdata keeps continuity between turns:
+    - history, inventory, named NPCs/locations, choices, current_scene, session metadata
 """
 
 import json
 import logging
 import os
-import sqlite3
-import uuid
 import asyncio
-import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Annotated
+from typing import List, Dict, Optional, Annotated
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -44,7 +49,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 # -------------------------
 # Logging
 # -------------------------
-logger = logging.getLogger("food_agent_sqlite")
+logger = logging.getLogger("voice_game_master")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -53,716 +58,602 @@ logger.addHandler(handler)
 load_dotenv(".env.local")
 
 # -------------------------
-# DB config & seeding
+# Simple Game World Definition
 # -------------------------
-DB_FILE = "order_db.sqlite"
-
-
-def get_db_path() -> str:
-    """Return absolute path for the DB file. If __file__ is not defined (interactive), fall back to cwd."""
-    try:
-        base = os.path.abspath(os.path.dirname(__file__))
-    except NameError:
-        base = os.getcwd()
-    if not os.path.isdir(base):
-        os.makedirs(base, exist_ok=True)
-    return os.path.join(base, DB_FILE)
-
-
-def get_conn():
-    path = get_db_path()
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-
-def seed_database():
-    """Create tables and seed the Indian catalog if empty."""
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        # Create catalog table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS catalog (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                category TEXT,
-                price REAL NOT NULL,
-                brand TEXT,
-                size TEXT,
-                units TEXT,
-                tags TEXT
-            )
-        """)
-
-        # Orders table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                timestamp TEXT,
-                total REAL,
-                customer_name TEXT,
-                address TEXT,
-                status TEXT DEFAULT 'received',
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
-
-        # Order items
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS order_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT,
-                item_id TEXT,
-                name TEXT,
-                unit_price REAL,
-                quantity INTEGER,
-                notes TEXT,
-                FOREIGN KEY(order_id) REFERENCES orders(order_id) ON DELETE CASCADE
-            )
-        """)
-
-        # Check if catalog empty
-        cur.execute("SELECT COUNT(1) FROM catalog")
-        if cur.fetchone()[0] == 0:
-            catalog = [
-                # Dairy
-                ("milk-amul-1l", "Amul Taaza Milk", "Dairy", 72.00, "Amul", "1L", "pack",
-                 json.dumps(["dairy", "essential"])),
-                ("paneer-200g", "Amul Malai Paneer", "Dairy", 95.00, "Amul", "200g", "pack",
-                 json.dumps(["dairy", "protein", "veg"])),
-                ("butter-100g", "Amul Butter", "Dairy", 58.00, "Amul", "100g", "pack",
-                 json.dumps(["dairy"])),
-                ("curd-400g", "Mother Dairy Dahi", "Dairy", 40.00, "Mother Dairy", "400g", "cup",
-                 json.dumps(["dairy"])),
-
-                # Staples/Pantry
-                ("atta-5kg", "Aashirvaad Whole Wheat Atta", "Staples", 245.00, "Aashirvaad", "5kg", "bag",
-                 json.dumps(["flour", "roti"])),
-                ("rice-basmati-1kg", "India Gate Basmati Rice", "Staples", 160.00, "India Gate", "1kg", "bag",
-                 json.dumps(["rice", "premium"])),
-                ("dal-toor-1kg", "Tata Sampann Toor Dal", "Staples", 185.00, "Tata", "1kg", "pack",
-                 json.dumps(["protein", "dal"])),
-                ("salt-1kg", "Tata Salt", "Staples", 28.00, "Tata", "1kg", "pack",
-                 json.dumps(["essential"])),
-                ("sugar-1kg", "Madhur Sugar", "Staples", 60.00, "Madhur", "1kg", "pack",
-                 json.dumps(["sweet"])),
-
-                # Snacks & Instant
-                ("maggi-masala", "Maggi 2-Minute Noodles", "Instant Food", 14.00, "Nestle", "70g", "pack",
-                 json.dumps(["snack", "noodles"])),
-                ("biscuits-marie", "Britannia Marie Gold", "Snacks", 35.00, "Britannia", "250g", "pack",
-                 json.dumps(["tea-time"])),
-                ("chips-lays", "Lays Magic Masala", "Snacks", 20.00, "Lays", "50g", "pack",
-                 json.dumps(["snack", "spicy"])),
-                ("tea-250g", "Red Label Tea", "Beverages", 140.00, "Brooke Bond", "250g", "pack",
-                 json.dumps(["chai", "tea"])),
-
-                # Veggies (Market Price estimates)
-                ("potato-1kg", "Fresh Potatoes", "Vegetables", 40.00, "", "1kg", "kg", json.dumps(["veg"])),
-                ("onion-1kg", "Fresh Onions", "Vegetables", 55.00, "", "1kg", "kg", json.dumps(["veg"])),
-                ("tomato-1kg", "Fresh Tomatoes", "Vegetables", 60.00, "", "1kg", "kg", json.dumps(["veg"])),
-                ("ginger-100g", "Fresh Ginger", "Vegetables", 20.00, "", "100g", "g",
-                 json.dumps(["veg", "chai"])),
-            ]
-            cur.executemany("""
-                INSERT INTO catalog (id, name, category, price, brand, size, units, tags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, catalog)
-            conn.commit()
-            logger.info(f"✅ Seeded Indian catalog into {get_db_path()}")
-
-        conn.close()
-    except Exception as e:
-        logger.exception("Failed to seed database: %s", e)
-
-
-# Seed DB on import/run
-seed_database()
+WORLD: Dict[str, Dict] = {
+    "intro": {
+        "title": "A Shadow over Brinmere",
+        "desc": (
+            "You awake on the damp shore of Brinmere, the moon a thin silver crescent. "
+            "A ruined watchtower smolders a short distance inland, and a narrow path leads "
+            "towards a cluster of cottages to the east. In the water beside you lies a "
+            "small, carved wooden box, half-buried in sand."
+        ),
+        "choices": {
+            "inspect_box": {
+                "desc": "Inspect the carved wooden box at the water's edge.",
+                "result_scene": "box",
+            },
+            "approach_tower": {
+                "desc": "Head inland towards the smoldering watchtower.",
+                "result_scene": "tower",
+            },
+            "walk_to_cottages": {
+                "desc": "Follow the path east towards the cottages.",
+                "result_scene": "cottages",  # NOTE: this scene is implied; you can add it later if you want.
+            },
+        },
+    },
+    "box": {
+        "title": "The Box",
+        "desc": (
+            "The box is warm despite the night air. Inside is a folded scrap of parchment "
+            "with a hatch-marked map and the words: 'Beneath the tower, the latch sings.' "
+            "As you read, a faint whisper seems to come from the tower, as if the wind "
+            "itself speaks your name."
+        ),
+        "choices": {
+            "take_map": {
+                "desc": "Take the map and keep it.",
+                "result_scene": "tower_approach",
+                "effects": {
+                    "add_journal": "Found map fragment: 'Beneath the tower, the latch sings.'"
+                },
+            },
+            "leave_box": {
+                "desc": "Leave the box where it is.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower": {
+        "title": "The Watchtower",
+        "desc": (
+            "The watchtower's stonework is cracked and warm embers glow within. An iron "
+            "latch covers a hatch at the base — it looks old but recently used. You can "
+            "try the latch, look for other entrances, or retreat."
+        ),
+        "choices": {
+            "try_latch_without_map": {
+                "desc": "Try the iron latch without any clue.",
+                "result_scene": "latch_fail",
+            },
+            "search_around": {
+                "desc": "Search the nearby rubble for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Step back to the shoreline.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_approach": {
+        "title": "Toward the Tower",
+        "desc": (
+            "Clutching the map, you approach the watchtower. The map's marks align with "
+            "the hatch at the base, and you notice a faint singing resonance when you step close."
+        ),
+        "choices": {
+            "open_hatch": {
+                "desc": "Use the map clue and try the hatch latch carefully.",
+                "result_scene": "latch_open",
+                "effects": {"add_journal": "Used map clue to open the hatch."},
+            },
+            "search_around": {
+                "desc": "Search for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "latch_fail": {
+        "title": "A Bad Twist",
+        "desc": (
+            "You twist the latch without heed — the mechanism sticks, and the effort sends "
+            "a shiver through the ground. From inside the tower, something rustles in alarm."
+        ),
+        "choices": {
+            "run_away": {
+                "desc": "Run back to the shore.",
+                "result_scene": "intro",
+            },
+            "stand_ground": {
+                "desc": "Stand and prepare for whatever emerges.",
+                "result_scene": "tower_combat",
+            },
+        },
+    },
+    "latch_open": {
+        "title": "The Hatch Opens",
+        "desc": (
+            "With the map's guidance the latch yields and the hatch opens with a breath of cold air. "
+            "Inside, a spiral of rough steps leads down into an ancient cellar lit by phosphorescent moss."
+        ),
+        "choices": {
+            "descend": {
+                "desc": "Descend into the cellar.",
+                "result_scene": "cellar",
+            },
+            "close_hatch": {
+                "desc": "Close the hatch and reconsider.",
+                "result_scene": "tower_approach",
+            },
+        },
+    },
+    "secret_entrance": {
+        "title": "A Narrow Gap",
+        "desc": (
+            "Behind a pile of rubble you find a narrow gap and old rope leading downward. "
+            "It smells of cold iron and something briny."
+        ),
+        "choices": {
+            "squeeze_in": {
+                "desc": "Squeeze through the gap and follow the rope down.",
+                "result_scene": "cellar",
+            },
+            "mark_and_return": {
+                "desc": "Mark the spot and return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar": {
+        "title": "Cellar of Echoes",
+        "desc": (
+            "The cellar opens into a circular chamber where runes glow faintly. At the center "
+            "is a stone plinth and upon it a small brass key and a sealed scroll."
+        ),
+        "choices": {
+            "take_key": {
+                "desc": "Pick up the brass key.",
+                "result_scene": "cellar_key",
+                "effects": {
+                    "add_inventory": "brass_key",
+                    "add_journal": "Found brass key on plinth.",
+                },
+            },
+            "open_scroll": {
+                "desc": "Break the seal and read the scroll.",
+                "result_scene": "scroll_reveal",
+                "effects": {
+                    "add_journal": "Scroll reads: 'The tide remembers what the villagers forget.'"
+                },
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and close the hatch behind you.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar_key": {
+        "title": "Key in Hand",
+        "desc": (
+            "With the key in your hand the runes dim and a hidden panel slides open, revealing a "
+            "small statue that begins to hum. A voice, ancient and kind, asks: 'Will you return what was taken?'"
+        ),
+        "choices": {
+            "pledge_help": {
+                "desc": "Pledge to return what was taken.",
+                "result_scene": "reward",
+                "effects": {"add_journal": "You pledged to return what was taken."},
+            },
+            "refuse": {
+                "desc": "Refuse and pocket the key.",
+                "result_scene": "cursed_key",
+                "effects": {
+                    "add_journal": "You pocketed the key; a weight grows in your pocket."
+                },
+            },
+        },
+    },
+    "scroll_reveal": {
+        "title": "The Scroll",
+        "desc": (
+            "The scroll tells of an heirloom taken by a water spirit that dwells beneath the tower. "
+            "It hints that the brass key 'speaks' when offered with truth."
+        ),
+        "choices": {
+            "search_for_key": {
+                "desc": "Search the plinth for a key.",
+                "result_scene": "cellar_key",
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and keep the knowledge to yourself.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_combat": {
+        "title": "Something Emerges",
+        "desc": (
+            "A hunched, brine-soaked creature scrambles out from the tower. Its eyes glow with hunger. "
+            "You must act quickly."
+        ),
+        "choices": {
+            "fight": {
+                "desc": "Fight the creature.",
+                "result_scene": "fight_win",
+            },
+            "flee": {
+                "desc": "Flee back to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "fight_win": {
+        "title": "After the Scuffle",
+        "desc": (
+            "You manage to fend off the creature; it flees wailing towards the sea. On the ground lies "
+            "a small locket engraved with a crest — likely the heirloom mentioned in the scroll."
+        ),
+        "choices": {
+            "take_locket": {
+                "desc": "Take the locket and examine it.",
+                "result_scene": "reward",
+                "effects": {
+                    "add_inventory": "engraved_locket",
+                    "add_journal": "Recovered an engraved locket.",
+                },
+            },
+            "leave_locket": {
+                "desc": "Leave the locket and tend to your wounds.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "reward": {
+        "title": "A Minor Resolution",
+        "desc": (
+            "A small sense of peace settles over Brinmere. Villagers may one day know the heirloom is found, or it may remain a secret. "
+            "You feel the night shift; the little arc of your story here closes for now."
+        ),
+        "choices": {
+            "end_session": {
+                "desc": "End the session and return to the shore (conclude mini-arc).",
+                "result_scene": "intro",
+            },
+            "keep_exploring": {
+                "desc": "Keep exploring for more mysteries.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cursed_key": {
+        "title": "A Weight in the Pocket",
+        "desc": (
+            "The brass key glows coldly. You feel a heavy sorrow that tugs at your thoughts. "
+            "Perhaps the key demands something in return..."
+        ),
+        "choices": {
+            "seek_redemption": {
+                "desc": "Seek a way to make amends.",
+                "result_scene": "reward",
+            },
+            "bury_key": {
+                "desc": "Bury the key and hope the weight fades.",
+                "result_scene": "intro",
+            },
+        },
+    },
+}
 
 # -------------------------
-# In-memory per-session cart
+# Per-session Userdata
 # -------------------------
-@dataclass
-class CartItem:
-    item_id: str
-    name: str
-    unit_price: float
-    quantity: int = 1
-    notes: str = ""
-
-
 @dataclass
 class Userdata:
-    cart: List[CartItem] = field(default_factory=list)
-    customer_name: Optional[str] = None
+    player_name: Optional[str] = None
+    current_scene: str = "intro"
+    history: List[Dict] = field(default_factory=list)  # {'from','action','to','time'}
+    journal: List[str] = field(default_factory=list)
+    inventory: List[str] = field(default_factory=list)
+    named_npcs: Dict[str, str] = field(default_factory=dict)
+    choices_made: List[str] = field(default_factory=list)
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
 # -------------------------
-# DB Helpers
+# Helper functions
+# -------------------------
+def scene_text(scene_key: str, userdata: Userdata) -> str:
+    """
+    Build the descriptive text for the current scene, and append choices as short hints.
+    Always end with 'What do you do?' so the voice flow prompts player input.
+    """
+    scene = WORLD.get(scene_key)
+    if not scene:
+        return "You are in a featureless void. What do you do?"
+
+    desc = scene["desc"]
+    desc += "\n\nChoices:\n"
+    for cid, cmeta in scene.get("choices", {}).items():
+        desc += f"- {cmeta['desc']} (say: {cid})\n"
+
+    desc += "\nWhat do you do?"
+    return desc
+
+
+def apply_effects(effects: Optional[Dict], userdata: Userdata) -> None:
+    if not effects:
+        return
+    if "add_journal" in effects:
+        userdata.journal.append(effects["add_journal"])
+    if "add_inventory" in effects:
+        userdata.inventory.append(effects["add_inventory"])
+    # Extendable for more effect keys later
+
+
+def summarize_scene_transition(
+    old_scene: str, action_key: str, result_scene: str, userdata: Userdata
+) -> str:
+    """Record the transition into history and return a short narrative hook."""
+    entry = {
+        "from": old_scene,
+        "action": action_key,
+        "to": result_scene,
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+    userdata.history.append(entry)
+    userdata.choices_made.append(action_key)
+    return f"You chose '{action_key}'."
+
+# -------------------------
+# Agent Tools (function_tool)
 # -------------------------
 
-def find_catalog_item_by_id_db(item_id: str) -> Optional[dict]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM catalog WHERE LOWER(id) = LOWER(?) LIMIT 1", (item_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    record = dict(row)
-    try:
-        record["tags"] = json.loads(record.get("tags") or "[]")
-    except Exception:
-        record["tags"] = []
-    return record
+@function_tool
+async def start_adventure(
+    ctx: RunContext[Userdata],
+    player_name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
+) -> str:
+    """Initialize a new adventure session for the player and return the opening description."""
+    userdata = ctx.userdata
+    if player_name:
+        userdata.player_name = player_name.strip()
+    userdata.current_scene = "intro"
+    userdata.history.clear()
+    userdata.journal.clear()
+    userdata.inventory.clear()
+    userdata.named_npcs.clear()
+    userdata.choices_made.clear()
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
 
-
-def search_catalog_by_name_db(query: str) -> List[dict]:
-    q = f"%{query.lower()}%"
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM catalog
-        WHERE LOWER(name) LIKE ? OR LOWER(tags) LIKE ?
-        LIMIT 50
-    """, (q, q))
-    rows = cur.fetchall()
-    conn.close()
-    results = []
-    for r in rows:
-        rec = dict(r)
-        try:
-            rec["tags"] = json.loads(rec.get("tags") or "[]")
-        except Exception:
-            rec["tags"] = []
-        results.append(rec)
-    return results
-
-
-def insert_order_db(
-    order_id: str,
-    timestamp: str,
-    total: float,
-    customer_name: str,
-    address: str,
-    status: str,
-    items: List[CartItem],
-):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO orders (order_id, timestamp, total, customer_name, address, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-    """, (order_id, timestamp, total, customer_name, address, status))
-    for ci in items:
-        cur.execute("""
-            INSERT INTO order_items (order_id, item_id, name, unit_price, quantity, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (order_id, ci.item_id, ci.name, ci.unit_price, ci.quantity, ci.notes))
-    conn.commit()
-    conn.close()
-
-
-def get_order_db(order_id: str) -> Optional[dict]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE order_id = ? LIMIT 1", (order_id,))
-    o = cur.fetchone()
-    if not o:
-        conn.close()
-        return None
-    order = dict(o)
-    cur.execute("SELECT * FROM order_items WHERE order_id = ?", (order_id,))
-    items = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    order["items"] = items
-    return order
-
-
-def list_orders_db(limit: int = 10, customer_name: Optional[str] = None) -> List[dict]:
-    conn = get_conn()
-    cur = conn.cursor()
-    if customer_name:
-        cur.execute(
-            "SELECT * FROM orders WHERE LOWER(customer_name) = LOWER(?) "
-            "ORDER BY created_at DESC LIMIT ?",
-            (customer_name, limit),
-        )
-    else:
-        cur.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
-
-
-def update_order_status_db(order_id: str, new_status: str) -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE orders SET status = ?, updated_at = datetime('now') WHERE order_id = ?",
-        (new_status, order_id),
+    opening = (
+        f"Greetings {userdata.player_name or 'traveler'}. "
+        f"Welcome to '{WORLD['intro']['title']}'.\n\n"
+        + scene_text("intro", userdata)
     )
-    changed = cur.rowcount
-    conn.commit()
-    conn.close()
-    return changed > 0
-
-# -------------------------
-# LOGIC & ASYNC SIMULATION
-# -------------------------
-
-RECIPE_MAP = {
-    "chai": ["milk-amul-1l", "tea-250g", "sugar-1kg", "ginger-100g"],
-    "paneer butter masala": ["paneer-200g", "butter-100g", "tomato-1kg"],
-    "maggi": ["maggi-masala"],
-    "dal chawal": ["dal-toor-1kg", "rice-basmati-1kg"],
-}
-
-_NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-}
+    if not opening.endswith("What do you do?"):
+        opening += "\nWhat do you do?"
+    return opening
 
 
-def _parse_servings_from_text(text: str) -> int:
-    """Try to extract servings/quantity from informal text like 'for two people' or 'for 3'. Default 1."""
-    text = (text or "").lower()
-    m = re.search(r"for\s+(\d+)\s*(?:people|person|servings)?", text)
-    if m:
-        try:
-            return max(1, int(m.group(1)))
-        except Exception:
-            pass
-    for word, num in _NUMBER_WORDS.items():
-        if f"for {word}" in text:
-            return num
-    return 1
+@function_tool
+async def get_scene(
+    ctx: RunContext[Userdata],
+) -> str:
+    """Return the current scene description (useful for 'remind me where I am')."""
+    userdata = ctx.userdata
+    scene_k = userdata.current_scene or "intro"
+    return scene_text(scene_k, userdata)
 
 
-def _infer_items_from_tags(query: str, max_results: int = 6) -> List[str]:
-    """Try to infer catalog items by matching query words to tags in the catalog. Returns list of item_ids."""
-    words = re.findall(r"\w+", (query or "").lower())
-    found = []
-    conn = get_conn()
-    cur = conn.cursor()
-    for w in words:
-        if len(found) >= max_results:
-            break
-        q = f'%"{w}"%'
-        cur.execute(
-            "SELECT * FROM catalog WHERE LOWER(tags) LIKE ? OR LOWER(name) LIKE ? LIMIT 10",
-            (q, f"%{w}%"),
+@function_tool
+async def player_action(
+    ctx: RunContext[Userdata],
+    action: Annotated[str, Field(description="Player spoken action or the short action code (e.g., 'inspect_box' or 'take the box')")],
+) -> str:
+    """
+    Accept player's action (natural language or action key), try to resolve it to a defined choice,
+    update userdata, advance to the next scene and return the GM's next description.
+    """
+    userdata = ctx.userdata
+    current = userdata.current_scene or "intro"
+    scene = WORLD.get(current)
+    if not scene:
+        userdata.current_scene = "intro"
+        scene = WORLD["intro"]
+
+    action_text = (action or "").strip().lower()
+    choices = scene.get("choices") or {}
+
+    if not choices:
+        # Dead-end scene: bounce them gently back to intro
+        userdata.current_scene = "intro"
+        resp = (
+            "This part of the story has no obvious actions left. "
+            "The scene softens and the shore of Brinmere returns around you.\n\n"
+            + scene_text("intro", userdata)
         )
-        rows = cur.fetchall()
-        for r in rows:
-            rid = r["id"]
-            if rid not in found:
-                found.append(rid)
-                if len(found) >= max_results:
+        return resp
+
+    # 1) Exact match on action key
+    chosen_key: Optional[str] = None
+    if action_text in choices:
+        chosen_key = action_text
+
+    # 2) Check if the player literally says the key somewhere in their text
+    if not chosen_key:
+        for cid in choices.keys():
+            if cid in action_text:
+                chosen_key = cid
+                break
+
+    # 3) Fuzzy match – check first few words of description
+    if not chosen_key:
+        for cid, cmeta in choices.items():
+            desc = cmeta.get("desc", "").lower()
+            if any(w for w in desc.split()[:4] if w and w in action_text):
+                chosen_key = cid
+                break
+
+    # 4) Last-resort keyword search
+    if not chosen_key:
+        for cid, cmeta in choices.items():
+            for kw in cmeta.get("desc", "").lower().split():
+                if kw and kw in action_text:
+                    chosen_key = cid
                     break
-    conn.close()
-    return found
-
-
-STATUS_FLOW = ["received", "confirmed", "shipped", "out_for_delivery", "delivered"]
-
-
-async def simulate_delivery_flow(order_id: str):
-    """
-    Background task: automatically advances order status every 5 seconds.
-    Flow: received -> confirmed -> shipped -> out_for_delivery -> delivered
-    """
-    logger.info(f"🔄 [Simulation] Started tracking simulation for {order_id}")
-
-    await asyncio.sleep(5)
-
-    for next_status in STATUS_FLOW[1:]:
-        curr_order = get_order_db(order_id)
-        if curr_order and curr_order.get("status") == "cancelled":
-            logger.info(f"🛑 [Simulation] Order {order_id} was cancelled. Stopping simulation.")
-            return
-
-        update_order_status_db(order_id, next_status)
-        logger.info(f"🚚 [Simulation] Order {order_id} updated to '{next_status}'")
-        await asyncio.sleep(5)
-
-    logger.info(f"✅ [Simulation] Order {order_id} simulation complete (Delivered).")
-
-
-def cart_total(cart: List[CartItem]) -> float:
-    return round(sum(ci.unit_price * ci.quantity for ci in cart), 2)
-
-# -------------------------
-# AGENT TOOLS
-# -------------------------
-
-@function_tool
-async def find_item(
-    ctx: RunContext[Userdata],
-    query: Annotated[str, Field(description="Name or partial name of item (e.g., 'milk', 'paneer')")],
-) -> str:
-    matches = search_catalog_by_name_db(query)
-    if not matches:
-        return f"No items found matching '{query}'. Try generic names like 'milk' or 'rice'."
-    lines = []
-    for it in matches[:10]:
-        lines.append(
-            f"- {it['name']} (id: {it['id']}) — ₹{it['price']:.2f} — {it.get('size', '')}"
-        )
-    return "Found:\n" + "\n".join(lines)
-
-
-@function_tool
-async def add_to_cart(
-    ctx: RunContext[Userdata],
-    item_id: Annotated[str, Field(description="Catalog item id")],
-    quantity: Annotated[int, Field(description="Quantity", ge=1)] = 1,
-    notes: Annotated[str, Field(description="Optional notes")] = "",
-) -> str:
-    item = find_catalog_item_by_id_db(item_id)
-    if not item:
-        return f"Item id '{item_id}' not found."
-
-    for ci in ctx.userdata.cart:
-        if ci.item_id.lower() == item_id.lower():
-            ci.quantity += quantity
-            if notes:
-                ci.notes = notes
-            total = cart_total(ctx.userdata.cart)
-            return f"Updated '{ci.name}' quantity to {ci.quantity}. Cart total: ₹{total:.2f}"
-
-    ci = CartItem(
-        item_id=item["id"],
-        name=item["name"],
-        unit_price=float(item["price"]),
-        quantity=quantity,
-        notes=notes,
-    )
-    ctx.userdata.cart.append(ci)
-    total = cart_total(ctx.userdata.cart)
-    return f"Added {quantity} x '{item['name']}' to cart. Cart total: ₹{total:.2f}"
-
-
-@function_tool
-async def remove_from_cart(
-    ctx: RunContext[Userdata],
-    item_id: Annotated[str, Field(description="Catalog item id to remove")],
-) -> str:
-    before = len(ctx.userdata.cart)
-    ctx.userdata.cart = [
-        ci for ci in ctx.userdata.cart if ci.item_id.lower() != item_id.lower()
-    ]
-    after = len(ctx.userdata.cart)
-    if before == after:
-        return f"Item '{item_id}' was not in your cart."
-    total = cart_total(ctx.userdata.cart)
-    return f"Removed item '{item_id}' from cart. Cart total: ₹{total:.2f}"
-
-
-@function_tool
-async def update_cart_quantity(
-    ctx: RunContext[Userdata],
-    item_id: Annotated[str, Field(description="Catalog item id to update")],
-    quantity: Annotated[int, Field(description="New quantity")] ,
-) -> str:
-    if quantity < 1:
-        return await remove_from_cart(ctx, item_id)
-    for ci in ctx.userdata.cart:
-        if ci.item_id.lower() == item_id.lower():
-            ci.quantity = quantity
-            total = cart_total(ctx.userdata.cart)
-            return f"Updated '{ci.name}' quantity to {ci.quantity}. Cart total: ₹{total:.2f}"
-    return f"Item '{item_id}' not found in cart."
-
-
-@function_tool
-async def show_cart(ctx: RunContext[Userdata]) -> str:
-    if not ctx.userdata.cart:
-        return "Your cart is empty."
-    lines = []
-    for ci in ctx.userdata.cart:
-        line_total = ci.unit_price * ci.quantity
-        lines.append(
-            f"- {ci.quantity} x {ci.name} @ ₹{ci.unit_price:.2f} each = ₹{line_total:.2f}"
-        )
-    total = cart_total(ctx.userdata.cart)
-    return "Your cart:\n" + "\n".join(lines) + f"\nTotal: ₹{total:.2f}"
-
-
-@function_tool
-async def add_recipe(
-    ctx: RunContext[Userdata],
-    dish_name: Annotated[str, Field(description="Name of dish, e.g. 'chai', 'maggi', 'dal chawal'")],
-) -> str:
-    key = dish_name.strip().lower()
-    if key not in RECIPE_MAP:
-        return (
-            f"Sorry, I don't have a recipe for '{dish_name}'. "
-            "Try 'chai', 'maggi' or 'paneer butter masala'."
-        )
-    added = []
-    for item_id in RECIPE_MAP[key]:
-        item = find_catalog_item_by_id_db(item_id)
-        if not item:
-            continue
-
-        found = False
-        for ci in ctx.userdata.cart:
-            if ci.item_id.lower() == item_id.lower():
-                ci.quantity += 1
-                found = True
+            if chosen_key:
                 break
-        if not found:
-            ctx.userdata.cart.append(
-                CartItem(
-                    item_id=item["id"],
-                    name=item["name"],
-                    unit_price=float(item["price"]),
-                    quantity=1,
-                )
-            )
-        added.append(item["name"])
 
-    total = cart_total(ctx.userdata.cart)
-    return f"Added ingredients for '{dish_name}': {', '.join(added)}. Cart total: ₹{total:.2f}"
+    if not chosen_key:
+        resp = (
+            "I didn't quite catch that action for this situation. "
+            "Try one of the listed choices or use a simple phrase like "
+            "'inspect the box' or 'go to the tower'.\n\n"
+            + scene_text(current, userdata)
+        )
+        return resp
+
+    choice_meta = choices[chosen_key]
+    result_scene = choice_meta.get("result_scene", current)
+    effects = choice_meta.get("effects")
+
+    apply_effects(effects, userdata)
+    note = summarize_scene_transition(current, chosen_key, result_scene, userdata)
+
+    userdata.current_scene = result_scene
+    next_desc = scene_text(result_scene, userdata)
+
+    persona_pre = "The Game Master, calm and slightly mysterious, replies:\n\n"
+    reply = f"{persona_pre}{note}\n\n{next_desc}"
+    if not reply.endswith("What do you do?"):
+        reply += "\nWhat do you do?"
+    return reply
 
 
 @function_tool
-async def ingredients_for(
+async def show_journal(
     ctx: RunContext[Userdata],
-    request: Annotated[str, Field(description="Natural language request, e.g. 'ingredients for peanut butter sandwich for two'")],
 ) -> str:
-    """
-    Handle high-level ingredient requests like 'ingredients for peanut butter sandwich'
-    or 'get me pasta for two people'. Attempts a map lookup first, then falls back to tag
-    inference.
-    """
-    text = (request or "").strip()
-    servings = _parse_servings_from_text(text)
+    """List remembered facts, inventory, and recent choices."""
+    userdata = ctx.userdata
+    lines: List[str] = []
+    lines.append(f"Session: {userdata.session_id} | Started at: {userdata.started_at}")
+    if userdata.player_name:
+        lines.append(f"Player: {userdata.player_name}")
 
-    m = re.search(r"ingredients? for (.+)", text, re.I)
-    if m:
-        dish = m.group(1)
+    if userdata.journal:
+        lines.append("\nJournal entries:")
+        for j in userdata.journal:
+            lines.append(f"- {j}")
     else:
-        m2 = re.search(
-            r"(?:make|for making|get me what i need for|i need) (.+)", text, re.I
-        )
-        dish = m2.group(1) if m2 else text
+        lines.append("\nJournal is empty so far.")
 
-    dish = re.sub(
-        r"for\s+\w+(?: people| person| persons)?", "", dish, flags=re.I
-    ).strip()
-    key = dish.lower()
-
-    if key in RECIPE_MAP:
-        item_ids = RECIPE_MAP[key]
+    if userdata.inventory:
+        lines.append("\nInventory:")
+        for it in userdata.inventory:
+            lines.append(f"- {it}")
     else:
-        item_ids = _infer_items_from_tags(dish)
+        lines.append("\nNo items in inventory yet.")
 
-    if not item_ids:
-        return (
-            f"Sorry, I couldn't determine ingredients for '{request}'. "
-            "Try a simpler phrase like 'chai' or 'maggi'."
-        )
-
-    added = []
-    for iid in item_ids:
-        item = find_catalog_item_by_id_db(iid)
-        if not item:
-            continue
-        found = False
-        for ci in ctx.userdata.cart:
-            if ci.item_id.lower() == iid.lower():
-                ci.quantity += servings
-                found = True
-                break
-        if not found:
-            ctx.userdata.cart.append(
-                CartItem(
-                    item_id=item["id"],
-                    name=item["name"],
-                    unit_price=float(item["price"]),
-                    quantity=servings,
-                )
+    lines.append("\nRecent choices:")
+    if userdata.history:
+        for h in userdata.history[-6:]:
+            lines.append(
+                f"- {h['time']} | from {h['from']} -> {h['to']} via {h['action']}"
             )
-        added.append(item["name"])
+    else:
+        lines.append("- None yet. Your story is just beginning.")
 
-    total = cart_total(ctx.userdata.cart)
-    return (
-        f"I've added {', '.join(added)} to your cart for '{dish}'. "
-        f"(Servings: {servings}). Cart total: ₹{total:.2f}"
-    )
+    lines.append("\nWhat do you do?")
+    return "\n".join(lines)
 
 
 @function_tool
-async def place_order(
+async def restart_adventure(
     ctx: RunContext[Userdata],
-    customer_name: Annotated[str, Field(description="Customer name")],
-    address: Annotated[str, Field(description="Delivery address")],
 ) -> str:
-    if not ctx.userdata.cart:
-        return "Your cart is empty."
+    """Reset the userdata and start again from the intro."""
+    userdata = ctx.userdata
+    userdata.current_scene = "intro"
+    userdata.history.clear()
+    userdata.journal.clear()
+    userdata.inventory.clear()
+    userdata.named_npcs.clear()
+    userdata.choices_made.clear()
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
 
-    order_id = str(uuid.uuid4())[:8]
-    now = datetime.utcnow().isoformat() + "Z"
-    total = cart_total(ctx.userdata.cart)
-
-    insert_order_db(
-        order_id=order_id,
-        timestamp=now,
-        total=total,
-        customer_name=customer_name,
-        address=address,
-        status="received",
-        items=ctx.userdata.cart,
+    greeting = (
+        "The world resets. A new tide laps at the shore of Brinmere, wiping away your previous path.\n\n"
+        + scene_text("intro", userdata)
     )
-
-    ctx.userdata.cart = []
-    ctx.userdata.customer_name = customer_name
-
-    try:
-        asyncio.create_task(simulate_delivery_flow(order_id))
-    except RuntimeError:
-        logger.warning("Could not schedule background simulation task (no running loop).")
-
-    return (
-        f"Your order has been placed! ✅\n"
-        f"Order ID: {order_id}\n"
-        f"Name: {customer_name}\n"
-        f"Address: {address}\n"
-        f"Total: ₹{total:.2f}\n"
-        "You can ask: 'What's the status of my order?' using the order ID."
-    )
-
-
-@function_tool
-async def cancel_order(
-    ctx: RunContext[Userdata],
-    order_id: Annotated[str, Field(description="Order ID to cancel")],
-) -> str:
-    order = get_order_db(order_id)
-    if not order:
-        return f"No order found with ID '{order_id}'."
-
-    if order["status"] in ("delivered", "cancelled"):
-        return (
-            f"Order '{order_id}' cannot be cancelled because it is already "
-            f"{order['status']}."
-        )
-
-    updated = update_order_status_db(order_id, "cancelled")
-    if not updated:
-        return f"Failed to cancel order '{order_id}'. Please try again."
-
-    return (
-        f"Your order '{order_id}' has been cancelled. "
-        "If any amount was charged, it will be refunded as per policy."
-    )
-
-
-@function_tool
-async def get_order_status(
-    ctx: RunContext[Userdata],
-    order_id: Annotated[str, Field(description="Order ID to check status for")],
-) -> str:
-    order = get_order_db(order_id)
-    if not order:
-        return f"No order found with ID '{order_id}'."
-    return (
-        f"Order '{order_id}' for {order.get('customer_name')} is currently "
-        f"'{order.get('status')}'."
-    )
-
-
-@function_tool
-async def order_history(
-    ctx: RunContext[Userdata],
-    customer_name: Annotated[
-        Optional[str],
-        Field(
-            description="Customer name to filter by, or empty/null for recent global orders"
-        ),
-    ] = None,
-    limit: Annotated[int, Field(description="Max number of orders to return", ge=1, le=20)] = 5,
-) -> str:
-    rows = list_orders_db(limit=limit, customer_name=customer_name)
-    if not rows:
-        return "No previous orders found."
-
-    lines = []
-    for o in rows:
-        lines.append(
-            f"- {o['order_id']} | {o['timestamp']} | ₹{o['total']:.2f} | "
-            f"Status: {o['status']} | Name: {o.get('customer_name')}"
-        )
-    return "Recent orders:\n" + "\n".join(lines)
+    if not greeting.endswith("What do you do?"):
+        greeting += "\nWhat do you do?"
+    return greeting
 
 # -------------------------
-# AGENT DEFINITION
+# Agent Definition
 # -------------------------
 
-class FoodAgent(Agent):
+class VoiceGameMasterAgent(Agent):
     def __init__(self):
         super().__init__(
             instructions="""
-            You are a friendly Indian grocery and food ordering assistant.
+            You are a **voice-only Game Master** (GM) running a small, focused fantasy adventure
+            called "A Shadow over Brinmere".
 
-            GOALS:
-            - Help the user find items (milk, paneer, Maggi, dal, atta, vegetables, etc.).
-            - Build and modify a cart (add, remove, update quantities).
-            - Suggest ingredients for common dishes like chai, maggi, dal chawal, paneer butter masala.
-            - Place orders and track order status using the tools.
+            ROLE:
+            - You are a calm, slightly mysterious narrator.
+            - You describe scenes briefly but vividly, then end with: "What do you do?"
+            - You keep the tone PG-13, no gore, no explicit content.
+
+            MEMORY & CONTEXT:
+            - The `Userdata` object tracks:
+              - current_scene, history, journal, inventory, named_npcs, choices_made.
+            - Always **respect** the scene and choices stored in state.
+            - Use the provided tools instead of inventing your own world-state.
 
             TOOLS:
-            - Use `find_item` to search the catalog.
-            - Use `add_to_cart`, `remove_from_cart`, `update_cart_quantity`, `show_cart` to manage the cart.
-            - Use `add_recipe` or `ingredients_for` to auto-add ingredients.
-            - Use `place_order` to create an order in the database.
-            - Use `cancel_order`, `get_order_status`, and `order_history` for order management.
+            - `start_adventure(player_name?)`:
+                Use when the user says things like "start game", "new adventure", "begin".
+            - `get_scene()`:
+                Use when the user says "where am I", "remind me", or seems lost.
+            - `player_action(action)`:
+                Use for *most* turns after the scene is set, passing the user's intent text.
+            - `show_journal()`:
+                Use when the user asks "what do I know", "what did I do", "show journal", or "what do I have".
+            - `restart_adventure()`:
+                Use when the user wants to reset or start over.
 
             STYLE:
-            - Speak in clear, simple English with Indian context (mention rupees, common brands like Amul, Tata, Britannia).
-            - Ask clarifying questions when needed (for quantity, brand preference, etc.).
-            - Confirm actions after using tools (e.g., after placing an order or cancelling).
+            - Short, punchy descriptions. No huge paragraphs.
+            - Always move the story forward.
+            - Never break character as the GM.
+            - Do not talk about tools, functions, or implementation details.
+
+            SAFETY:
+            - No real-world self-harm coaching, no explicit violence, no hate or harassment.
+            - If user pushes into unsafe territory, gently redirect the story or refuse.
             """,
             tools=[
-                find_item,
-                add_to_cart,
-                remove_from_cart,
-                update_cart_quantity,
-                show_cart,
-                add_recipe,
-                ingredients_for,
-                place_order,
-                cancel_order,
-                get_order_status,
-                order_history,
+                start_adventure,
+                get_scene,
+                player_action,
+                show_journal,
+                restart_adventure,
             ],
         )
 
 # -------------------------
-# ENTRYPOINT
+# ENTRYPOINT & PREWARM
 # -------------------------
 
 def prewarm(proc: JobProcess):
+    """Preload VAD model for low-latency turn detection."""
     proc.userdata["vad"] = silero.VAD.load()
 
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-
-    logger.info("🚀 Starting Food & Grocery Agent (SQLite - Indian Context)")
+    logger.info("🎲 Starting Voice Game Master session")
 
     userdata = Userdata()
 
@@ -770,7 +661,7 @@ async def entrypoint(ctx: JobContext):
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-natalie",
+            voice="en-US-ken",        # Neutral, narratory male voice
             style="Conversational",
             text_pacing=True,
         ),
@@ -780,7 +671,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     await session.start(
-        agent=FoodAgent(),
+        agent=VoiceGameMasterAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
